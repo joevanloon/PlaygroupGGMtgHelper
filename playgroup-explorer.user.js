@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playgroup.gg Auto-Organizer
 // @namespace    https://playgroup.gg/
-// @version      3.1.0
+// @version      3.2.0
 // @description  Auto-organizes your board on pass turn. Press F2 to open the explorer panel.
 // @author       You
 // @match        https://playgroup.gg/*
@@ -105,7 +105,6 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.hr
     // GLOBAL WATCHERS — only active when explorer is open
     // ─────────────────────────────────────────────────────────────────────────
     let watchersActive = false;
-    let mutationObserver = null;
     const patchedSymbol = Symbol('pg_patched');
 
     function startWatchers() {
@@ -198,12 +197,14 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.hr
 
       // ── Click listener — log all clicks with selector ─────────────────────
       document._pg_clickListener = (e) => {
-        if (captureClickActive) return; // handled by capture mode
-        if (e.target.closest('#pg-panel')) return; // ignore our own UI
+        if (captureClickActive) return;
+        // Ignore clicks inside our own panel by checking the ID chain
+        let el = e.target;
+        while (el) { if (el.id === 'pg-panel') return; el = el.parentElement; }
         logEv('CLICK', selectorFor(e.target), {
-          text: e.target.textContent?.trim().slice(0, 60),
+          text: (e.target.textContent || '').trim().slice(0, 60),
           tag: e.target.tagName,
-          class: e.target.className,
+          class: String(e.target.className || ''),
         });
       };
       document.addEventListener('click', document._pg_clickListener, true);
@@ -211,30 +212,16 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.hr
       // ── Key listener ──────────────────────────────────────────────────────
       document._pg_keyListener = (e) => {
         if (captureKeyActive) return;
-        if (e.target.matches('input, textarea, [contenteditable]')) return;
-        if (e.target.closest('#pg-panel')) return; // ignore our own UI
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        // Ignore keys from our panel
+        let el = e.target;
+        while (el) { if (el.id === 'pg-panel') return; el = el.parentElement; }
         logEv('KEYDOWN', e.code, { key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey });
       };
       document.addEventListener('keydown', document._pg_keyListener, true);
 
-      // ── DOM mutation observer ─────────────────────────────────────────────
-      mutationObserver = new MutationObserver((mutations) => {
-        for (const m of mutations) {
-          for (const node of m.addedNodes) {
-            if (node.nodeType !== 1) continue;
-            // Never observe our own panel or its children
-            if (node.id === 'pg-panel' || node.closest?.('#pg-panel')) continue;
-            const text = (node.textContent || '').trim().slice(0, 60);
-            const cls = String(node.className || '');
-            const dataAction = node.getAttribute?.('data-action') || '';
-            const dataCtrl = node.getAttribute?.('data-controller') || '';
-            if (/pass|turn|organiz|arrange|end.*turn|phase|step/i.test(text + cls + dataAction + dataCtrl)) {
-              logEv('DOM-ADD', selectorFor(node), { text, class: cls, dataAction, dataCtrl });
-            }
-          }
-        }
-      });
-      mutationObserver.observe(document.body, { childList: true, subtree: true });
+      // NOTE: DOM mutation observer intentionally omitted — it creates feedback
+      // loops observing our own panel. WebSocket messages capture all game events.
 
       console.log('[PG] All watchers active');
     }
@@ -247,10 +234,6 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.hr
       }
       if (document._pg_keyListener) {
         document.removeEventListener('keydown', document._pg_keyListener, true);
-      }
-      if (mutationObserver) {
-        mutationObserver.disconnect();
-        mutationObserver = null;
       }
       console.log('[PG] Watchers stopped (fetch/XHR/WS/dispatchEvent patches remain until page reload)');
     }
