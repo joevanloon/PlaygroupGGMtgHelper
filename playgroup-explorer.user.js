@@ -6,6 +6,8 @@
 // @author       You
 // @match        https://playgroup.gg/*
 // @match        https://playgroup.gg/live_sessions/*
+// @updateURL    https://raw.githubusercontent.com/joevanloon/PlaygroupGGMtgHelper/main/playgroup-explorer.user.js
+// @downloadURL  https://raw.githubusercontent.com/joevanloon/PlaygroupGGMtgHelper/main/playgroup-explorer.user.js
 // @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
