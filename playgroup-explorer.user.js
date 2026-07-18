@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playgroup.gg Auto-Organizer
 // @namespace    https://playgroup.gg/
-// @version      3.2.0
+// @version      3.3.0
 // @description  Auto-organizes your board on pass turn. Press F2 to open the explorer panel.
 // @author       You
 // @match        https://playgroup.gg/*
@@ -20,7 +20,7 @@
 //   the game's own WebSocket/GameChannel messages (including pass_turn,
 //   move_card, etc.) and exports a full log for analysis.
 
-console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.href);
+console.log('[PG] Playgroup.gg Auto-Organizer v3.3 loading... URL:', location.href);
 
 (function () {
   'use strict';
@@ -775,10 +775,17 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.hr
       a.click();
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // DEEP RUNTIME INSPECTOR
+    // Walks the live JS heap to find Vue app, Phaser game, KeybindingManager,
+    // StateManager, and any organize/arrange callable methods.
+    // ─────────────────────────────────────────────────────────────────────────
+
     function scanWindow() {
+      // Shallow keyword scan of window keys for quick overview
       const results = [];
       const scan = (obj, path, depth) => {
-        if (depth > 3) return;
+        if (depth > 2) return;
         try {
           Object.keys(obj || {}).forEach(k => {
             if (/^(on|webkit|moz|ms)/.test(k)) return;
@@ -793,10 +800,233 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.hr
           });
         } catch (_) {}
       };
-      scan(window, 'window', 0);
+      scan(win, 'window', 0);
       logEv('WINDOW-SCAN', `Found ${results.length} game-related keys`, results);
       console.log('[PG] Window scan results:', results);
       refreshLogPanel();
+    }
+
+    function deepInspect() {
+      const report = {
+        vue: null,
+        phaser: null,
+        keybindingManager: null,
+        stateManager: null,
+        organizeMethods: [],
+        passTurnMethods: [],
+        allGameObjects: [],
+      };
+
+      // ── 1. Find Vue 3 app instance ────────────────────────────────────────
+      // Vue 3 mounts onto a DOM element and exposes .__vue_app__
+      try {
+        const vueRoots = [...document.querySelectorAll('[data-v-app], #app, #game-app, [id*="app"], canvas')];
+        for (const el of vueRoots) {
+          if (el.__vue_app__) {
+            report.vue = { found: true, element: el.id || el.tagName };
+            const vueApp = el.__vue_app__;
+            // Walk component tree
+            const walkComponent = (vnode, depth = 0) => {
+              if (!vnode || depth > 6) return;
+              try {
+                const component = vnode.component;
+                if (component) {
+                  const proxy = component.proxy || component.ctx;
+                  if (proxy) {
+                    // Look for organize/arrange/passTurn methods on component proxy
+                    const keys = Object.keys(proxy).concat(
+                      Object.getOwnPropertyNames(Object.getPrototypeOf(proxy) || {})
+                    );
+                    keys.forEach(k => {
+                      try {
+                        const v = proxy[k];
+                        if (typeof v === 'function') {
+                          if (/organiz|arrange|sort.*card|card.*sort/i.test(k)) {
+                            report.organizeMethods.push({ path: `vue.component.${k}`, fn: String(v).slice(0, 150) });
+                          }
+                          if (/passTurn|pass_turn|endTurn|end_turn|nextTurn|next_turn/i.test(k)) {
+                            report.passTurnMethods.push({ path: `vue.component.${k}`, fn: String(v).slice(0, 150) });
+                          }
+                          if (/game|board|card|zone|battlefield|hand|library|state|manager|channel/i.test(k)) {
+                            report.allGameObjects.push({ path: `vue.component.${k}`, type: typeof v });
+                          }
+                        } else if (v && typeof v === 'object') {
+                          if (/game|board|state|manager|channel/i.test(k)) {
+                            report.allGameObjects.push({ path: `vue.component.${k}`, type: 'object', keys: Object.keys(v).slice(0, 20) });
+                          }
+                        }
+                      } catch (_) {}
+                    });
+
+                    // Store reference for interactive use
+                    win.__pg_vueComponent = proxy;
+                  }
+                  // Recurse into children
+                  const subTree = component.subTree;
+                  if (subTree) {
+                    walkComponent(subTree, depth + 1);
+                    if (subTree.children) {
+                      (Array.isArray(subTree.children) ? subTree.children : [subTree.children])
+                        .forEach(child => walkComponent(child, depth + 1));
+                    }
+                  }
+                }
+                if (vnode.children) {
+                  (Array.isArray(vnode.children) ? vnode.children : [vnode.children])
+                    .forEach(child => walkComponent(child, depth + 1));
+                }
+              } catch (_) {}
+            };
+            try { walkComponent(vueApp._instance?.subTree); } catch (_) {}
+            break;
+          }
+        }
+      } catch (e) { report.vue = { error: String(e) }; }
+
+      // ── 2. Find Phaser game instance ──────────────────────────────────────
+      // Phaser stores its game on window.Phaser or the canvas element
+      try {
+        // Check common locations
+        const phaserGame = win.Phaser?.game || win.__PHASER_GAME__ || win.game;
+        if (phaserGame?.scene) {
+          report.phaser = { found: true };
+          const scenes = phaserGame.scene.scenes || [];
+          scenes.forEach((scene, i) => {
+            const sceneName = scene.sys?.settings?.key || `scene_${i}`;
+            const sceneKeys = Object.getOwnPropertyNames(scene)
+              .concat(Object.getOwnPropertyNames(Object.getPrototypeOf(scene) || {}));
+            sceneKeys.forEach(k => {
+              try {
+                const v = scene[k];
+                if (typeof v === 'function') {
+                  if (/organiz|arrange|sort.*card|layout/i.test(k)) {
+                    report.organizeMethods.push({ path: `phaser.${sceneName}.${k}`, fn: String(v).slice(0, 150) });
+                  }
+                  if (/passTurn|endTurn|nextTurn|pass_turn/i.test(k)) {
+                    report.passTurnMethods.push({ path: `phaser.${sceneName}.${k}`, fn: String(v).slice(0, 150) });
+                  }
+                  if (/game|board|card|zone|state|manager/i.test(k)) {
+                    report.allGameObjects.push({ path: `phaser.${sceneName}.${k}`, type: 'function' });
+                  }
+                } else if (v && typeof v === 'object' && !/^(sys|events|input|tweens|time|physics|cameras|add|make|scale|scene|anims|sound|data|plugins|registry|textures|renderer|cache|loader)$/.test(k)) {
+                  if (/game|board|card|zone|state|manager|channel/i.test(k)) {
+                    report.allGameObjects.push({ path: `phaser.${sceneName}.${k}`, type: 'object', keys: Object.keys(v).slice(0, 20) });
+                    // Store for interactive use
+                    win[`__pg_phaser_${k}`] = v;
+                  }
+                }
+              } catch (_) {}
+            });
+            win[`__pg_scene_${sceneName}`] = scene;
+          });
+        } else {
+          // Try to find via canvas __phaser
+          const canvases = document.querySelectorAll('canvas');
+          canvases.forEach(c => {
+            const game = c.__phaser || c._phaser;
+            if (game) { report.phaser = { found: true, via: 'canvas.__phaser' }; win.__pg_phaserGame = game; }
+          });
+        }
+      } catch (e) { report.phaser = { error: String(e) }; }
+
+      // ── 3. Hunt for KeybindingManager in all window objects ───────────────
+      try {
+        const huntObj = (obj, path, depth = 0, visited = new WeakSet()) => {
+          if (depth > 4 || !obj || typeof obj !== 'object') return;
+          if (visited.has(obj)) return;
+          visited.add(obj);
+          try {
+            const keys = Object.keys(obj);
+            for (const k of keys) {
+              try {
+                const v = obj[k];
+                const p = `${path}.${k}`;
+                if (v && typeof v === 'object') {
+                  // KeybindingManager has a registerBinding / getBindings type method
+                  if (typeof v.registerBinding === 'function' || typeof v.getBindings === 'function' ||
+                      typeof v.register === 'function' && typeof v.handle === 'function') {
+                    report.keybindingManager = { path: p, keys: Object.keys(v).slice(0, 30) };
+                    win.__pg_keybindingManager = v;
+                  }
+                  // StateManager
+                  if (typeof v.getState === 'function' || typeof v.setState === 'function' ||
+                      (typeof v.state === 'object' && typeof v.dispatch === 'function')) {
+                    report.stateManager = { path: p, keys: Object.keys(v).slice(0, 30) };
+                    win.__pg_stateManager = v;
+                  }
+                  if (depth < 3) huntObj(v, p, depth + 1, visited);
+                }
+              } catch (_) {}
+            }
+          } catch (_) {}
+        };
+        huntObj(win, 'window', 0);
+      } catch (e) {}
+
+      // ── 4. Check if Vue component is accessible via $root / $app ─────────
+      try {
+        if (win.__pg_vueComponent) {
+          const root = win.__pg_vueComponent.$root || win.__pg_vueComponent;
+          // Look for $refs, $data deeply
+          const data = root.$data || {};
+          Object.keys(data).forEach(k => {
+            const v = data[k];
+            if (v && typeof v === 'object') {
+              // Check for organize/arrange on nested objects
+              const subKeys = typeof v === 'object' ? Object.keys(v) : [];
+              subKeys.forEach(sk => {
+                if (typeof v[sk] === 'function' && /organiz|arrange|layout|sort/i.test(sk)) {
+                  report.organizeMethods.push({ path: `vue.$data.${k}.${sk}`, fn: String(v[sk]).slice(0, 150) });
+                }
+              });
+            }
+          });
+        }
+      } catch (_) {}
+
+      // Summary
+      console.log('[PG] Deep inspect report:', report);
+      console.log('[PG] References saved: window.__pg_vueComponent, window.__pg_stateManager, window.__pg_keybindingManager, window.__pg_scene_*');
+
+      logEv('DEEP-INSPECT', `Vue:${!!report.vue?.found} Phaser:${!!report.phaser?.found} KBM:${!!report.keybindingManager} SM:${!!report.stateManager} Organize:${report.organizeMethods.length} PassTurn:${report.passTurnMethods.length} GameObjs:${report.allGameObjects.length}`, report);
+      refreshLogPanel();
+      return report;
+    }
+
+    function hookKeybindingManager() {
+      // Intercept KeybindingManager by patching EventTarget.dispatchEvent for
+      // the specific events the KBM logs: 'context-result' and 'unhandled'
+      // We saw these in the console: [PG Live][KeybindingManager] context-result
+      // Strategy: find the KBM instance and wrap its handler method
+
+      const kbm = win.__pg_keybindingManager;
+      if (!kbm) {
+        // Try to find it by looking for objects that have been logged to console
+        // with [PG Live][KeybindingManager] prefix — scan for the pattern
+        logEv('KBM-HOOK', 'Not found yet — run Deep Inspect first, then try again', {});
+        return;
+      }
+
+      // Wrap every function on the KBM to log calls
+      const wrapped = [];
+      Object.keys(kbm).forEach(k => {
+        if (typeof kbm[k] === 'function') {
+          const orig = kbm[k].bind(kbm);
+          kbm[k] = function (...args) {
+            logEv('KBM-CALL', k, { args: JSON.stringify(args).slice(0, 200) });
+            // If this looks like an organize action, capture it
+            const argStr = JSON.stringify(args).toLowerCase();
+            if (/organiz|arrange|layout|sort/.test(argStr)) {
+              logEv('KBM-ORGANIZE', k, { args: argStr });
+              win.__pg_organizeCall = { method: k, args };
+            }
+            return orig(...args);
+          };
+          wrapped.push(k);
+        }
+      });
+      logEv('KBM-HOOK', `Wrapped ${wrapped.length} KBM methods`, { methods: wrapped });
+      console.log('[PG] KeybindingManager hooked:', wrapped);
     }
 
     // ── Build the panel ───────────────────────────────────────────────────────
@@ -851,11 +1081,18 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.hr
       const actionsSec = section('⚡ Actions', 'pg-actions-section', `
         <div class="pg-row">
           <button class="pg-btn pg-btn-green"  id="pg-run-org">▶ Organize Now</button>
-          <button class="pg-btn pg-btn-yellow" id="pg-scan-win">🔍 Scan window</button>
           <button class="pg-btn pg-btn-blue"   id="pg-export-log">📥 Export Log</button>
         </div>
         <div class="pg-row" style="margin-top:4px">
-          <button class="pg-btn pg-btn-gray" id="pg-copy-cfg">📋 Copy Config JSON</button>
+          <button class="pg-btn pg-btn-yellow" id="pg-scan-win">🔍 Shallow Scan</button>
+          <button class="pg-btn pg-btn-yellow" id="pg-deep-inspect">🔬 Deep Inspect</button>
+        </div>
+        <div class="pg-row" style="margin-top:4px">
+          <button class="pg-btn pg-btn-gray"   id="pg-hook-kbm">🪝 Hook Keybindings</button>
+          <button class="pg-btn pg-btn-gray"   id="pg-copy-cfg">📋 Copy Config JSON</button>
+        </div>
+        <div style="color:#6b7280;font-size:10px;margin-top:4px">
+          After Deep Inspect: window.__pg_vueComponent, __pg_stateManager, __pg_keybindingManager, __pg_scene_* available in console
         </div>
       `, true);
       body.appendChild(actionsSec);
@@ -882,6 +1119,8 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.hr
       };
       panelEl.querySelector('#pg-run-org').onclick = () => organizeBoard();
       panelEl.querySelector('#pg-scan-win').onclick = () => scanWindow();
+      panelEl.querySelector('#pg-deep-inspect').onclick = () => deepInspect();
+      panelEl.querySelector('#pg-hook-kbm').onclick = () => hookKeybindingManager();
       panelEl.querySelector('#pg-export-log').onclick = () => exportLog();
       panelEl.querySelector('#pg-clear-log').onclick = () => { eventLog.length = 0; refreshLogPanel(); };
       panelEl.querySelector('#pg-copy-cfg').onclick = () => {
