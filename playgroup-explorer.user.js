@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playgroup.gg Auto-Organizer
 // @namespace    https://playgroup.gg/
-// @version      3.4.0
+// @version      3.5.0
 // @description  Auto-organizes your board on pass turn. Press F2 to open the explorer panel.
 // @author       You
 // @match        https://playgroup.gg/*
@@ -20,7 +20,7 @@
 //   the game's own WebSocket/GameChannel messages (including pass_turn,
 //   move_card, etc.) and exports a full log for analysis.
 
-console.log('[PG] Playgroup.gg Auto-Organizer v3.4 loading... URL:', location.href);
+console.log('[PG] Playgroup.gg Auto-Organizer v3.5 loading... URL:', location.href);
 
 (function () {
   'use strict';
@@ -161,6 +161,14 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.4 loading... URL:', location.hr
                 if (CFG.autoOrganizeOnPassTurn) {
                   setTimeout(() => organizeBoard(), CFG.organizeDelay);
                 }
+              }
+
+              // move_battlefield_card confirms organize worked — log it clearly
+              if (eventType === 'move_battlefield_card' || eventType === 'move_card') {
+                logEv('CARD-MOVED', eventType, {
+                  cardId: parsed?.message?.card_id || parsed?.card_id,
+                  zone: parsed?.message?.zone || parsed?.zone,
+                });
               }
             } catch (_) {
               logEv('WS-MSG-RAW', url, { raw: String(ev.data).slice(0, 300) });
@@ -327,19 +335,23 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.4 loading... URL:', location.hr
     //   3. Try to call it via the Vue component proxy
     // ─────────────────────────────────────────────────────────────────────────
     function organizeBoard() {
-      // ── Strategy 1: Phaser scene direct call ──────────────────────────────
+      // ── Strategy 1: CardContextMenu Vue component direct call ─────────────
+      const ctxResult = callContextMenuOrganize();
+      if (ctxResult) return true;
+
+      // ── Strategy 2: Phaser scene direct call ──────────────────────────────
       const phaserResult = callPhaserOrganize();
       if (phaserResult) return true;
 
-      // ── Strategy 2: Click visible organize button (context menu) ──────────
+      // ── Strategy 3: Click visible organize button (context menu in DOM) ───
       const btnResult = clickOrganizeButton();
       if (btnResult) return true;
 
-      // ── Strategy 3: Vue component method ──────────────────────────────────
+      // ── Strategy 4: Vue component method ──────────────────────────────────
       const vueResult = callVueOrganize();
       if (vueResult) return true;
 
-      console.log('[PG] organizeBoard: all strategies failed — run Deep Inspect to discover the organize function');
+      console.log('[PG] organizeBoard: all strategies failed — open the explorer, run Deep Inspect, then Hook Keybindings');
       logEv('ORGANIZE-FAIL', 'no strategy succeeded', {});
       return false;
     }
@@ -383,29 +395,117 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.4 loading... URL:', location.hr
     }
 
     function clickOrganizeButton() {
-      // The captured selector is for the context menu button — it's only
-      // visible when a context menu is open. Try clicking it if present.
+      // The captured selector is for the context menu button — only visible when open.
       if (CFG.organizeBtnSelector) {
         const btn = document.querySelector(CFG.organizeBtnSelector);
-        if (btn) {
+        // Make sure it's not inside our own panel
+        if (btn && !btn.closest('#pg-panel')) {
           console.log('[PG] Clicking organize button:', CFG.organizeBtnSelector);
           btn.click();
           logEv('ORGANIZE', 'context-menu-btn', { selector: CFG.organizeBtnSelector });
           return true;
         }
       }
-      // Also search broadly for any visible button with organize-related text
+      // Search for any visible button with organize-related text, excluding our panel
       const allBtns = document.querySelectorAll('button, [role="button"]');
       for (const btn of allBtns) {
+        if (btn.closest('#pg-panel')) continue; // never match our own UI
         const text = (btn.textContent || '').trim().toLowerCase();
         if (/organiz|arrange|sort.*card|tidy|clean.*up/.test(text)) {
-          console.log('[PG] Found organize button by text:', text);
+          console.log('[PG] Found organize button by text:', text, selectorFor(btn));
           btn.click();
           logEv('ORGANIZE', 'text-match-btn', { text, selector: selectorFor(btn) });
           return true;
         }
       }
       return false;
+    }
+
+    // ── CardContextMenu Vue component hook ───────────────────────────────────
+    // The game uses CardContextMenu.vue which emits menu-shown with menuKeys.
+    // We intercept it to find the organize action and call it directly,
+    // without needing to simulate right-click + visual menu navigation.
+    let cardContextMenuProxy = null;
+
+    function hookCardContextMenu() {
+      // Walk all Vue component instances looking for CardContextMenu
+      const found = findVueComponent(el => {
+        // CardContextMenu logs "[PG Live][ContextMenu]" — look for that component
+        const name = el.type?.name || el.type?.__name || '';
+        return /CardContextMenu|ContextMenu/i.test(name);
+      });
+
+      if (!found) {
+        console.log('[PG] CardContextMenu not found — try after opening a context menu');
+        return false;
+      }
+
+      cardContextMenuProxy = found.proxy || found.ctx;
+      console.log('[PG] Found CardContextMenu component, keys:', Object.keys(cardContextMenuProxy).slice(0, 30));
+      win.__pg_contextMenu = cardContextMenuProxy;
+      logEv('KBM-HOOK', 'CardContextMenu found', { keys: Object.keys(cardContextMenuProxy).slice(0, 30) });
+      return true;
+    }
+
+    function callContextMenuOrganize() {
+      const proxy = cardContextMenuProxy || win.__pg_contextMenu;
+      if (!proxy) return false;
+      // Look for organize-related methods
+      const keys = Object.keys(proxy);
+      const organizeKey = keys.find(k => /organiz|arrange|layout/i.test(k) && typeof proxy[k] === 'function');
+      if (organizeKey) {
+        console.log('[PG] Calling CardContextMenu organize:', organizeKey);
+        proxy[organizeKey]();
+        logEv('ORGANIZE', `contextMenu.${organizeKey}`, {});
+        return true;
+      }
+      // Also check $refs and emits
+      const emitFn = proxy.$emit;
+      if (emitFn) {
+        // Try emitting organize-related events
+        for (const evt of ['organize', 'arrange', 'organizeBoard', 'arrange-board']) {
+          try {
+            proxy.$emit(evt);
+            logEv('ORGANIZE', `contextMenu.$emit(${evt})`, {});
+            console.log('[PG] Emitted:', evt);
+            return true;
+          } catch (_) {}
+        }
+      }
+      return false;
+    }
+
+    function findVueComponent(predicate) {
+      // Walk the Vue app's component tree looking for a component matching predicate
+      const app = win.__pg_vueApp;
+      if (!app) return null;
+      const walk = (vnode, depth = 0) => {
+        if (!vnode || depth > 15) return null;
+        try {
+          if (vnode.component && predicate(vnode.component)) return vnode.component;
+          const c = vnode.component;
+          if (c?.subTree) {
+            const r = walk(c.subTree, depth + 1);
+            if (r) return r;
+          }
+          const children = vnode.children;
+          if (Array.isArray(children)) {
+            for (const child of children) {
+              const r = walk(child, depth + 1);
+              if (r) return r;
+            }
+          } else if (children && typeof children === 'object') {
+            for (const child of Object.values(children)) {
+              if (child && typeof child === 'object') {
+                const r = walk(child, depth + 1);
+                if (r) return r;
+              }
+            }
+          }
+        } catch (_) {}
+        return null;
+      };
+      try { return walk(app._instance?.subTree); } catch (_) { return null; }
     }
 
     function callVueOrganize() {
@@ -891,6 +991,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.4 loading... URL:', location.hr
           if (el.__vue_app__) {
             report.vue = { found: true, element: el.id || el.tagName };
             const vueApp = el.__vue_app__;
+            win.__pg_vueApp = vueApp; // Save for findVueComponent()
             // Walk component tree
             const walkComponent = (vnode, depth = 0) => {
               if (!vnode || depth > 6) return;
@@ -1194,6 +1295,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.4 loading... URL:', location.hr
           <button class="pg-btn pg-btn-yellow" id="pg-deep-inspect">🔬 Deep Inspect</button>
         </div>
         <div class="pg-row" style="margin-top:4px">
+          <button class="pg-btn pg-btn-gray"   id="pg-hook-ctx">🪝 Hook Context Menu</button>
           <button class="pg-btn pg-btn-gray"   id="pg-hook-kbm">🪝 Hook Keybindings</button>
           <button class="pg-btn pg-btn-gray"   id="pg-copy-cfg">📋 Copy Config JSON</button>
         </div>
@@ -1226,6 +1328,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.4 loading... URL:', location.hr
       panelEl.querySelector('#pg-run-org').onclick = () => organizeBoard();
       panelEl.querySelector('#pg-scan-win').onclick = () => scanWindow();
       panelEl.querySelector('#pg-deep-inspect').onclick = () => deepInspect();
+      panelEl.querySelector('#pg-hook-ctx').onclick = () => hookCardContextMenu();
       panelEl.querySelector('#pg-hook-kbm').onclick = () => hookKeybindingManager();
       panelEl.querySelector('#pg-export-log').onclick = () => exportLog();
       panelEl.querySelector('#pg-clear-log').onclick = () => { eventLog.length = 0; refreshLogPanel(); };
