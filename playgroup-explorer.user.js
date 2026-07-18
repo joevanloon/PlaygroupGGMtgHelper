@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playgroup.gg Auto-Organizer
 // @namespace    https://playgroup.gg/
-// @version      3.3.0
+// @version      3.4.0
 // @description  Auto-organizes your board on pass turn. Press F2 to open the explorer panel.
 // @author       You
 // @match        https://playgroup.gg/*
@@ -20,7 +20,7 @@
 //   the game's own WebSocket/GameChannel messages (including pass_turn,
 //   move_card, etc.) and exports a full log for analysis.
 
-console.log('[PG] Playgroup.gg Auto-Organizer v3.3 loading... URL:', location.href);
+console.log('[PG] Playgroup.gg Auto-Organizer v3.4 loading... URL:', location.href);
 
 (function () {
   'use strict';
@@ -320,48 +320,109 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.3 loading... URL:', location.hr
 
     // ─────────────────────────────────────────────────────────────────────────
     // BOARD ORGANIZER
+    // Since cards are rendered on a Phaser canvas (not DOM elements), we
+    // can't position them via CSS. Instead we:
+    //   1. Try to call the Phaser scene's organize method directly (best)
+    //   2. Try to click the organize button if it's visible in a context menu
+    //   3. Try to call it via the Vue component proxy
     // ─────────────────────────────────────────────────────────────────────────
     function organizeBoard() {
-      const boardSel = CFG.boardSelector;
-      const cardSel = CFG.cardSelector;
+      // ── Strategy 1: Phaser scene direct call ──────────────────────────────
+      const phaserResult = callPhaserOrganize();
+      if (phaserResult) return true;
 
-      if (!boardSel || !cardSel) {
-        console.log('[PG] organizeBoard: selectors not configured yet');
-        return false;
+      // ── Strategy 2: Click visible organize button (context menu) ──────────
+      const btnResult = clickOrganizeButton();
+      if (btnResult) return true;
+
+      // ── Strategy 3: Vue component method ──────────────────────────────────
+      const vueResult = callVueOrganize();
+      if (vueResult) return true;
+
+      console.log('[PG] organizeBoard: all strategies failed — run Deep Inspect to discover the organize function');
+      logEv('ORGANIZE-FAIL', 'no strategy succeeded', {});
+      return false;
+    }
+
+    function callPhaserOrganize() {
+      // Try known Phaser game locations
+      try {
+        const gameObj = win.__pg_phaserGame || win.game || win.Phaser?.game;
+        if (!gameObj?.scene) return false;
+        const scenes = gameObj.scene.scenes || [];
+        for (const scene of scenes) {
+          // Look for organize/arrange methods on the scene or its properties
+          const organizeKeys = Object.getOwnPropertyNames(scene).filter(k =>
+            /organiz|arrange|layout|sortCard/i.test(k) && typeof scene[k] === 'function'
+          );
+          if (organizeKeys.length) {
+            console.log('[PG] Calling Phaser organize:', organizeKeys[0]);
+            scene[organizeKeys[0]]();
+            logEv('ORGANIZE', `phaser.scene.${organizeKeys[0]}`, {});
+            return true;
+          }
+          // Also check nested managers on the scene
+          for (const key of Object.keys(scene)) {
+            const obj = scene[key];
+            if (!obj || typeof obj !== 'object') continue;
+            try {
+              const subKeys = Object.getOwnPropertyNames(obj).filter(k =>
+                /organiz|arrange|layout/i.test(k) && typeof obj[k] === 'function'
+              );
+              if (subKeys.length) {
+                console.log(`[PG] Calling Phaser scene.${key}.${subKeys[0]}`);
+                obj[subKeys[0]]();
+                logEv('ORGANIZE', `phaser.scene.${key}.${subKeys[0]}`, {});
+                return true;
+              }
+            } catch (_) {}
+          }
+        }
+      } catch (e) { console.log('[PG] Phaser organize failed:', e); }
+      return false;
+    }
+
+    function clickOrganizeButton() {
+      // The captured selector is for the context menu button — it's only
+      // visible when a context menu is open. Try clicking it if present.
+      if (CFG.organizeBtnSelector) {
+        const btn = document.querySelector(CFG.organizeBtnSelector);
+        if (btn) {
+          console.log('[PG] Clicking organize button:', CFG.organizeBtnSelector);
+          btn.click();
+          logEv('ORGANIZE', 'context-menu-btn', { selector: CFG.organizeBtnSelector });
+          return true;
+        }
       }
-
-      const board = document.querySelector(boardSel);
-      if (!board) {
-        console.log('[PG] organizeBoard: board element not found for selector:', boardSel);
-        return false;
+      // Also search broadly for any visible button with organize-related text
+      const allBtns = document.querySelectorAll('button, [role="button"]');
+      for (const btn of allBtns) {
+        const text = (btn.textContent || '').trim().toLowerCase();
+        if (/organiz|arrange|sort.*card|tidy|clean.*up/.test(text)) {
+          console.log('[PG] Found organize button by text:', text);
+          btn.click();
+          logEv('ORGANIZE', 'text-match-btn', { text, selector: selectorFor(btn) });
+          return true;
+        }
       }
+      return false;
+    }
 
-      const cards = [...board.querySelectorAll(cardSel)];
-      if (!cards.length) {
-        console.log('[PG] organizeBoard: no cards found for selector:', cardSel);
-        return false;
-      }
-
-      console.log(`[PG] organizeBoard: arranging ${cards.length} cards`);
-
-      const boardRect = board.getBoundingClientRect();
-      const cols = Math.ceil(Math.sqrt(cards.length));
-      const cardW = Math.floor((boardRect.width - (cols + 1) * 8) / cols);
-      const cardH = Math.floor(cardW * 1.4);
-
-      cards.forEach((card, i) => {
-        const col = i % cols;
-        const row = Math.floor(i / cols);
-        const x = col * (cardW + 8) + 8;
-        const y = row * (cardH + 8) + 8;
-        card.style.position = 'absolute';
-        card.style.left = `${x}px`;
-        card.style.top = `${y}px`;
-        card.style.transition = 'left 0.25s ease, top 0.25s ease';
-      });
-
-      logEv('ORGANIZE', boardSel, { cardCount: cards.length, cols });
-      return true;
+    function callVueOrganize() {
+      try {
+        const proxy = win.__pg_vueComponent;
+        if (!proxy) return false;
+        const organizeKeys = Object.keys(proxy).filter(k =>
+          /organiz|arrange|layout/i.test(k) && typeof proxy[k] === 'function'
+        );
+        if (organizeKeys.length) {
+          console.log('[PG] Calling Vue organize:', organizeKeys[0]);
+          proxy[organizeKeys[0]]();
+          logEv('ORGANIZE', `vue.${organizeKeys[0]}`, {});
+          return true;
+        }
+      } catch (e) { console.log('[PG] Vue organize failed:', e); }
+      return false;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -390,9 +451,14 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.3 loading... URL:', location.hr
       };
 
       tryHook();
-      // Re-try on DOM changes (Turbo navigation can replace buttons)
-      const obs = new MutationObserver(tryHook);
-      obs.observe(document.body, { childList: true, subtree: true });
+      // Re-try on DOM changes — defer until body exists (script runs at document-start)
+      const attachObs = () => {
+        const target = document.body || document.documentElement;
+        if (!target) { setTimeout(attachObs, 100); return; }
+        const obs = new MutationObserver(tryHook);
+        obs.observe(target, { childList: true, subtree: true });
+      };
+      attachObs();
     }
 
     function hookPassTurnKey() {
@@ -884,48 +950,88 @@ console.log('[PG] Playgroup.gg Auto-Organizer v3.3 loading... URL:', location.hr
       } catch (e) { report.vue = { error: String(e) }; }
 
       // ── 2. Find Phaser game instance ──────────────────────────────────────
-      // Phaser stores its game on window.Phaser or the canvas element
       try {
-        // Check common locations
-        const phaserGame = win.Phaser?.game || win.__PHASER_GAME__ || win.game;
+        // Step 1: locate the game object via multiple strategies
+        let phaserGame = win.__pg_phaserGame || win.Phaser?.game || win.__PHASER_GAME__ || win.game;
+
+        if (!phaserGame?.scene) {
+          // Phaser 3 adds a non-enumerable reference on the canvas element
+          for (const c of document.querySelectorAll('canvas')) {
+            for (const k of Object.getOwnPropertyNames(c)) {
+              try {
+                const v = c[k];
+                if (v && typeof v === 'object' && v.scene && v.loop) {
+                  phaserGame = v;
+                  console.log('[PG] Found Phaser game on canvas property:', k);
+                  break;
+                }
+              } catch (_) {}
+            }
+            if (phaserGame?.scene) break;
+          }
+        }
+
+        if (!phaserGame?.scene) {
+          // Check common window-level names
+          for (const k of ['__PHASER_GAME__', '__game', '_game', 'phaserGame', 'GAME', 'g']) {
+            if (win[k]?.scene) { phaserGame = win[k]; break; }
+          }
+        }
+
         if (phaserGame?.scene) {
-          report.phaser = { found: true };
-          const scenes = phaserGame.scene.scenes || [];
-          scenes.forEach((scene, i) => {
-            const sceneName = scene.sys?.settings?.key || `scene_${i}`;
-            const sceneKeys = Object.getOwnPropertyNames(scene)
-              .concat(Object.getOwnPropertyNames(Object.getPrototypeOf(scene) || {}));
-            sceneKeys.forEach(k => {
+          win.__pg_phaserGame = phaserGame;
+          report.phaser = { found: true, sceneCount: phaserGame.scene.scenes?.length };
+
+          // Step 2: walk all scenes and their properties
+          const walkScene = (scene, sceneName) => {
+            const PHASER_INTERNALS = /^(sys|events|input|tweens|time|physics|cameras|add|make|scale|scene|anims|sound|data|plugins|registry|textures|renderer|cache|loader|children|displayList|updateList|game|lights|matter)$/;
+            const allKeys = [];
+            let proto = scene;
+            // Walk prototype chain to get all inherited methods too
+            while (proto && proto !== Object.prototype) {
+              allKeys.push(...Object.getOwnPropertyNames(proto));
+              proto = Object.getPrototypeOf(proto);
+            }
+            const seen = new Set();
+            for (const k of allKeys) {
+              if (seen.has(k) || PHASER_INTERNALS.test(k) || k.startsWith('_')) continue;
+              seen.add(k);
               try {
                 const v = scene[k];
                 if (typeof v === 'function') {
-                  if (/organiz|arrange|sort.*card|layout/i.test(k)) {
-                    report.organizeMethods.push({ path: `phaser.${sceneName}.${k}`, fn: String(v).slice(0, 150) });
+                  if (/organiz|arrange|sort.*card|layout.*card|tidy/i.test(k)) {
+                    report.organizeMethods.push({ path: `phaser.${sceneName}.${k}`, fn: String(v).slice(0, 200) });
                   }
-                  if (/passTurn|endTurn|nextTurn|pass_turn/i.test(k)) {
-                    report.passTurnMethods.push({ path: `phaser.${sceneName}.${k}`, fn: String(v).slice(0, 150) });
+                  if (/passTurn|endTurn|nextTurn|pass_turn|end_turn/i.test(k)) {
+                    report.passTurnMethods.push({ path: `phaser.${sceneName}.${k}`, fn: String(v).slice(0, 200) });
                   }
-                  if (/game|board|card|zone|state|manager/i.test(k)) {
+                  if (/card|board|zone|hand|battlefield|permanent|state|manager|channel/i.test(k)) {
                     report.allGameObjects.push({ path: `phaser.${sceneName}.${k}`, type: 'function' });
                   }
-                } else if (v && typeof v === 'object' && !/^(sys|events|input|tweens|time|physics|cameras|add|make|scale|scene|anims|sound|data|plugins|registry|textures|renderer|cache|loader)$/.test(k)) {
-                  if (/game|board|card|zone|state|manager|channel/i.test(k)) {
-                    report.allGameObjects.push({ path: `phaser.${sceneName}.${k}`, type: 'object', keys: Object.keys(v).slice(0, 20) });
-                    // Store for interactive use
-                    win[`__pg_phaser_${k}`] = v;
+                } else if (v && typeof v === 'object') {
+                  if (/card|board|zone|hand|state|manager|channel|permanent/i.test(k)) {
+                    const subKeys = Object.keys(v).slice(0, 30);
+                    report.allGameObjects.push({ path: `phaser.${sceneName}.${k}`, type: 'object', subKeys });
+                    win[`__pg_${sceneName}_${k}`] = v;
+                    // Scan one level deeper for organize methods
+                    for (const sk of Object.keys(v)) {
+                      if (typeof v[sk] === 'function' && /organiz|arrange|layout/i.test(sk)) {
+                        report.organizeMethods.push({ path: `phaser.${sceneName}.${k}.${sk}`, fn: String(v[sk]).slice(0, 200) });
+                      }
+                    }
                   }
                 }
               } catch (_) {}
-            });
+            }
             win[`__pg_scene_${sceneName}`] = scene;
+          };
+
+          (phaserGame.scene.scenes || []).forEach((scene, i) => {
+            const sceneName = scene.sys?.settings?.key || `scene_${i}`;
+            walkScene(scene, sceneName);
           });
         } else {
-          // Try to find via canvas __phaser
-          const canvases = document.querySelectorAll('canvas');
-          canvases.forEach(c => {
-            const game = c.__phaser || c._phaser;
-            if (game) { report.phaser = { found: true, via: 'canvas.__phaser' }; win.__pg_phaserGame = game; }
-          });
+          report.phaser = { found: false, note: 'Could not locate Phaser game object' };
         }
       } catch (e) { report.phaser = { error: String(e) }; }
 
