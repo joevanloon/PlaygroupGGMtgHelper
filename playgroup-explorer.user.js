@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Playgroup.gg Auto-Organizer
 // @namespace    https://playgroup.gg/
-// @version      4.0.0
+// @version      3.1.0
 // @description  Auto-organizes your board on pass turn. Press F2 to open the explorer panel.
 // @author       You
 // @match        https://playgroup.gg/*
-// @grant        none
+// @match        https://playgroup.gg/live_sessions/*
+// @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
 
@@ -16,19 +17,17 @@
 //   Explorer mode: press F2 to toggle the diagnostic panel. It intercepts
 //   the game's own WebSocket/GameChannel messages (including pass_turn,
 //   move_card, etc.) and exports a full log for analysis.
-//
-// NOTE: @grant none means Tampermonkey gives us direct window access (no sandbox),
-// which is required to intercept WebSocket before the game creates its connection.
 
-console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.href);
+console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.href);
 
 (function () {
   'use strict';
 
   console.log('[PG] Script IIFE started');
 
-  // With @grant none, window IS the page's window — no unsafeWindow needed
-  const win = window;
+  // Use unsafeWindow when available (Tampermonkey) so we share the same JS
+  // heap as the game code — critical for intercepting WebSocket and Vue/Phaser
+  const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
   // ── Try/catch the whole thing so any error surfaces clearly ──────────────────
   try {
@@ -79,20 +78,24 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
     // ─────────────────────────────────────────────────────────────────────────
     const MAX_EVENTS = 500;
     const eventLog = [];
+    let _logLock = false; // prevent re-entrant log calls causing feedback loops
 
     function logEv(type, source, data) {
-      const entry = {
-        t: new Date().toISOString(),
-        type,
-        source: String(source).slice(0, 120),
-        data,
-      };
-      eventLog.unshift(entry);
-      if (eventLog.length > MAX_EVENTS) eventLog.pop();
-      if (explorerOpen) refreshLogPanel();
-      // Always log to console in explorer mode
-      if (explorerOpen) {
-        console.log(`[PG:${type}]`, source, data);
+      if (_logLock) return;
+      _logLock = true;
+      try {
+        const entry = {
+          t: new Date().toISOString(),
+          type,
+          source: String(source).slice(0, 120),
+          data,
+        };
+        eventLog.unshift(entry);
+        if (eventLog.length > MAX_EVENTS) eventLog.pop();
+        if (explorerOpen) refreshLogPanel();
+        if (explorerOpen) console.log(`[PG:${type}]`, source, data);
+      } finally {
+        _logLock = false;
       }
     }
 
@@ -179,7 +182,8 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         const origDispatch = win.EventTarget.prototype.dispatchEvent;
         win.EventTarget.prototype.dispatchEvent = function (event) {
           const skip = /^(mouse|pointer|touch|scroll|resize|focus|blur|input|change|transition|animation|drag|wheel|select)/i;
-          if (!skip.test(event.type)) {
+          const isOurPanel = this instanceof Element && this.closest?.('#pg-panel');
+          if (!skip.test(event.type) && !isOurPanel) {
             logEv('DISPATCH', event.type, {
               target: selectorFor(this),
               detail: event.detail ?? null,
@@ -193,6 +197,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
       // ── Click listener — log all clicks with selector ─────────────────────
       document._pg_clickListener = (e) => {
         if (captureClickActive) return; // handled by capture mode
+        if (e.target.closest('#pg-panel')) return; // ignore our own UI
         logEv('CLICK', selectorFor(e.target), {
           text: e.target.textContent?.trim().slice(0, 60),
           tag: e.target.tagName,
@@ -205,6 +210,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
       document._pg_keyListener = (e) => {
         if (captureKeyActive) return;
         if (e.target.matches('input, textarea, [contenteditable]')) return;
+        if (e.target.closest('#pg-panel')) return; // ignore our own UI
         logEv('KEYDOWN', e.code, { key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey });
       };
       document.addEventListener('keydown', document._pg_keyListener, true);
@@ -214,6 +220,8 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         for (const m of mutations) {
           for (const node of m.addedNodes) {
             if (node.nodeType !== 1) continue;
+            // Never observe our own panel or its children
+            if (node.id === 'pg-panel' || node.closest?.('#pg-panel')) continue;
             const text = (node.textContent || '').trim().slice(0, 60);
             const cls = String(node.className || '');
             const dataAction = node.getAttribute?.('data-action') || '';
