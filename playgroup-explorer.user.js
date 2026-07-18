@@ -1,28 +1,33 @@
 // ==UserScript==
 // @name         Playgroup.gg Auto-Organizer
 // @namespace    https://playgroup.gg/
-// @version      2.0.0
-// @description  Auto-organizes your board on pass turn. Press Alt+Shift+E to open the explorer panel.
+// @version      3.0.0
+// @description  Auto-organizes your board on pass turn. Press F2 to open the explorer panel.
 // @author       You
 // @match        https://playgroup.gg/*
-// @grant        none
-// @run-at       document-end
+// @match        https://playgroup.gg/live_sessions/*
+// @grant        unsafeWindow
+// @run-at       document-start
 // ==/UserScript==
 
 // HOW TO USE:
-//   Production mode: once selectors are configured, the script silently hooks
-//   pass-turn and auto-organizes your board.
+//   Production mode: once configured, silently hooks pass_turn events and
+//   auto-organizes your board.
 //
-//   Explorer mode: press Alt+Shift+E to open the diagnostic panel. It will
-//   guide you through capturing selectors and export a full event log so you
-//   can see exactly what the game is doing under the hood.
+//   Explorer mode: press F2 to toggle the diagnostic panel. It intercepts
+//   the game's own WebSocket/GameChannel messages (including pass_turn,
+//   move_card, etc.) and exports a full log for analysis.
 
-console.log('[PG] Playgroup.gg Auto-Organizer v2.0 loading...');
+console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.href);
 
 (function () {
   'use strict';
 
   console.log('[PG] Script IIFE started');
+
+  // Use unsafeWindow when available (Tampermonkey) so we share the same JS
+  // heap as the game code — critical for intercepting WebSocket and Vue/Phaser
+  const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
   // ── Try/catch the whole thing so any error surfaces clearly ──────────────────
   try {
@@ -103,44 +108,55 @@ console.log('[PG] Playgroup.gg Auto-Organizer v2.0 loading...');
       console.log('[PG] Starting global watchers');
 
       // ── Intercept fetch ───────────────────────────────────────────────────
-      if (!window.fetch[patchedSymbol]) {
-        const origFetch = window.fetch.bind(window);
-        window.fetch = function (...args) {
+      if (!win.fetch[patchedSymbol]) {
+        const origFetch = win.fetch.bind(win);
+        win.fetch = function (...args) {
           const url = String(args[0]?.url || args[0] || '');
           const method = String(args[1]?.method || 'GET');
           const body = args[1]?.body;
           logEv('FETCH', `${method} ${url}`, { body: body ? String(body).slice(0, 200) : null });
           return origFetch(...args);
         };
-        window.fetch[patchedSymbol] = true;
+        win.fetch[patchedSymbol] = true;
       }
 
       // ── Intercept XHR ────────────────────────────────────────────────────
-      if (!XMLHttpRequest.prototype[patchedSymbol]) {
-        const origOpen = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+      if (!win.XMLHttpRequest.prototype[patchedSymbol]) {
+        const origOpen = win.XMLHttpRequest.prototype.open;
+        win.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
           this._pg_url = url;
           this._pg_method = method;
           return origOpen.call(this, method, url, ...rest);
         };
-        const origSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.send = function (body) {
+        const origSend = win.XMLHttpRequest.prototype.send;
+        win.XMLHttpRequest.prototype.send = function (body) {
           logEv('XHR', `${this._pg_method} ${this._pg_url}`, { body: body ? String(body).slice(0, 200) : null });
           return origSend.call(this, body);
         };
-        XMLHttpRequest.prototype[patchedSymbol] = true;
+        win.XMLHttpRequest.prototype[patchedSymbol] = true;
       }
 
-      // ── Intercept WebSocket ───────────────────────────────────────────────
-      if (!window.WebSocket[patchedSymbol]) {
-        const OrigWS = window.WebSocket;
+      // ── Intercept WebSocket on unsafeWindow so we see the game's WS ──────
+      if (!win.WebSocket[patchedSymbol]) {
+        const OrigWS = win.WebSocket;
         function PatchedWS(url, protocols) {
           const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
           logEv('WS-OPEN', url, {});
           ws.addEventListener('message', (ev) => {
             try {
               const parsed = JSON.parse(ev.data);
-              logEv('WS-MSG', url, parsed);
+              // GameChannel events come through as ActionCable messages
+              // e.g. { type: 'message', message: { event_type: 'pass_turn', ... } }
+              const eventType = parsed?.message?.event_type || parsed?.event_type || parsed?.type;
+              logEv('WS-MSG', eventType || 'unknown', parsed);
+
+              // Hook pass_turn directly by event name
+              if (eventType === 'pass_turn') {
+                logEv('PASS-TURN-DETECTED', 'gameChannel', parsed.message || parsed);
+                if (CFG.autoOrganizeOnPassTurn) {
+                  setTimeout(() => organizeBoard(), CFG.organizeDelay);
+                }
+              }
             } catch (_) {
               logEv('WS-MSG-RAW', url, { raw: String(ev.data).slice(0, 300) });
             }
@@ -154,13 +170,13 @@ console.log('[PG] Playgroup.gg Auto-Organizer v2.0 loading...');
         Object.defineProperty(PatchedWS, 'CLOSING', { get: () => OrigWS.CLOSING });
         Object.defineProperty(PatchedWS, 'CLOSED', { get: () => OrigWS.CLOSED });
         PatchedWS[patchedSymbol] = true;
-        window.WebSocket = PatchedWS;
+        win.WebSocket = PatchedWS;
       }
 
       // ── Intercept dispatchEvent ───────────────────────────────────────────
-      if (!EventTarget.prototype.dispatchEvent[patchedSymbol]) {
-        const origDispatch = EventTarget.prototype.dispatchEvent;
-        EventTarget.prototype.dispatchEvent = function (event) {
+      if (!win.EventTarget.prototype.dispatchEvent[patchedSymbol]) {
+        const origDispatch = win.EventTarget.prototype.dispatchEvent;
+        win.EventTarget.prototype.dispatchEvent = function (event) {
           const skip = /^(mouse|pointer|touch|scroll|resize|focus|blur|input|change|transition|animation|drag|wheel|select)/i;
           if (!skip.test(event.type)) {
             logEv('DISPATCH', event.type, {
@@ -170,7 +186,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v2.0 loading...');
           }
           return origDispatch.call(this, event);
         };
-        EventTarget.prototype.dispatchEvent[patchedSymbol] = true;
+        win.EventTarget.prototype.dispatchEvent[patchedSymbol] = true;
       }
 
       // ── Click listener — log all clicks with selector ─────────────────────
@@ -801,7 +817,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v2.0 loading...');
         <div id="pg-panel-header">
           <div>
             <div class="title">🔬 PG Explorer</div>
-            <div class="hint">Alt+Shift+E to toggle</div>
+            <div class="hint">F2 to toggle</div>
           </div>
           <div id="pg-panel-header-btns">
             <button id="pg-min-btn">_</button>
@@ -925,18 +941,20 @@ console.log('[PG] Playgroup.gg Auto-Organizer v2.0 loading...');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // KEYBIND: Alt+Shift+E toggles the explorer
+    // KEYBIND: F2 toggles the explorer
+    // Use capture:true at window level so we fire BEFORE KeybindingManager
     // ─────────────────────────────────────────────────────────────────────────
-    document.addEventListener('keydown', (e) => {
-      if (e.altKey && e.shiftKey && e.code === 'KeyE') {
+    win.addEventListener('keydown', (e) => {
+      if (e.code === 'F2') {
         e.preventDefault();
+        e.stopImmediatePropagation();
         if (explorerOpen) {
           closePanel();
         } else {
           openPanel();
         }
       }
-    });
+    }, true);
 
     // ─────────────────────────────────────────────────────────────────────────
     // BOOT
