@@ -1,12 +1,11 @@
 // ==UserScript==
 // @name         Playgroup.gg Auto-Organizer
 // @namespace    https://playgroup.gg/
-// @version      3.0.0
+// @version      4.0.0
 // @description  Auto-organizes your board on pass turn. Press F2 to open the explorer panel.
 // @author       You
 // @match        https://playgroup.gg/*
-// @match        https://playgroup.gg/live_sessions/*
-// @grant        unsafeWindow
+// @grant        none
 // @run-at       document-start
 // ==/UserScript==
 
@@ -17,17 +16,19 @@
 //   Explorer mode: press F2 to toggle the diagnostic panel. It intercepts
 //   the game's own WebSocket/GameChannel messages (including pass_turn,
 //   move_card, etc.) and exports a full log for analysis.
+//
+// NOTE: @grant none means Tampermonkey gives us direct window access (no sandbox),
+// which is required to intercept WebSocket before the game creates its connection.
 
-console.log('[PG] Playgroup.gg Auto-Organizer v3.0 loading... URL:', location.href);
+console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.href);
 
 (function () {
   'use strict';
 
   console.log('[PG] Script IIFE started');
 
-  // Use unsafeWindow when available (Tampermonkey) so we share the same JS
-  // heap as the game code — critical for intercepting WebSocket and Vue/Phaser
-  const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  // With @grant none, window IS the page's window — no unsafeWindow needed
+  const win = window;
 
   // ── Try/catch the whole thing so any error surfaces clearly ──────────────────
   try {
