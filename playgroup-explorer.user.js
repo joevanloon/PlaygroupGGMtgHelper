@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playgroup.gg Auto-Organizer
 // @namespace    https://playgroup.gg/
-// @version      4.0.0
+// @version      4.1.0
 // @description  Auto-organizes your board on pass turn. Press F2 to open the explorer panel.
 // @author       You
 // @match        https://playgroup.gg/*
@@ -58,6 +58,10 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
       organizeDelay:       300,
       // Learned from Hook Capture:
       learnedOrganizeCall: null, // { type: 'vue-method'|'vue-emit'|'phaser', path, args }
+      // New: additional capture results for fallback strategies
+      learnedWsMessage:    null, // { identifier, data } — raw ActionCable message
+      learnedVueEmit:      null, // { event, args }
+      learnedDomSelector:  null, // CSS selector for the organize button element
     };
 
     let CFG = Object.assign({}, DEFAULTS);
@@ -184,6 +188,25 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
             }
           });
           ws.addEventListener('close', () => logEv('WS-CLOSE', url, {}));
+
+          // Intercept outbound send() so hook-capture can record organize messages
+          const origSendWs = ws.send.bind(ws);
+          ws.send = function (data) {
+            try {
+              const parsed = JSON.parse(data);
+              const inner = parsed?.data ? JSON.parse(parsed.data) : null;
+              const action = inner?.action;
+              if (action) {
+                logEv('WS-SEND', action, { identifier: parsed.identifier, data: inner });
+                // If hook capture is active, record organize messages
+                if (hookCaptureActive && /organiz|arrange/i.test(action)) {
+                  win.__pg_capturedWsMessage = { identifier: parsed.identifier, data: inner };
+                }
+              }
+            } catch (_) {}
+            return origSendWs(data);
+          };
+
           return ws;
         }
         PatchedWS.prototype = OrigWS.prototype;
@@ -298,9 +321,27 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
     // BOARD ORGANIZER — tries strategies in order
     // ─────────────────────────────────────────────────────────────────────────
     function organizeBoard() {
-      // ── Strategy 0: Replay a previously learned call (most reliable) ──────
+      // ── Strategy 0a: Replay a previously learned Vue/Phaser method call ───
       if (CFG.learnedOrganizeCall) {
         const ok = replayLearnedCall(CFG.learnedOrganizeCall);
+        if (ok) return true;
+      }
+
+      // ── Strategy 0b: Replay learned Vue emit event ────────────────────────
+      if (CFG.learnedVueEmit) {
+        const ok = replayLearnedVueEmit(CFG.learnedVueEmit);
+        if (ok) return true;
+      }
+
+      // ── Strategy 0c: Replay learned WebSocket message ─────────────────────
+      if (CFG.learnedWsMessage) {
+        const ok = replayLearnedWsMessage(CFG.learnedWsMessage);
+        if (ok) return true;
+      }
+
+      // ── Strategy 0d: Click learned DOM selector for organize button ────────
+      if (CFG.learnedDomSelector) {
+        const ok = clickLearnedDomSelector(CFG.learnedDomSelector);
         if (ok) return true;
       }
 
@@ -373,6 +414,84 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
 
     function resolvePath(obj, path) {
       return path.split('.').reduce((o, k) => (o ? o[k] : undefined), obj);
+    }
+
+    // ── Replay learned Vue emit ───────────────────────────────────────────────
+    function replayLearnedVueEmit(learnedEmit) {
+      try {
+        const { event, args, componentName } = learnedEmit;
+        // Walk all Vue components and emit on any that have the right emit
+        const vueApp = win.__pg_vueApp;
+        if (!vueApp) return false;
+        let emitted = false;
+        const walk = (vnode, depth = 0) => {
+          if (!vnode || depth > 12) return;
+          try {
+            const c = vnode.component;
+            if (c) {
+              const name = c.type?.name || c.type?.__name || '';
+              // Try to emit on the same component type that was captured, or all
+              if (!componentName || name === componentName || depth < 3) {
+                if (typeof c.emit === 'function') {
+                  c.emit(event, ...(args || []));
+                  emitted = true;
+                  logEv('ORGANIZE', `replay.vue-emit.${event}`, { component: name });
+                }
+                if (c.proxy?.$emit) {
+                  c.proxy.$emit(event, ...(args || []));
+                  emitted = true;
+                }
+              }
+              if (c.subTree) walk(c.subTree, depth + 1);
+            }
+            const children = vnode.children;
+            if (Array.isArray(children)) children.forEach(ch => walk(ch, depth + 1));
+            else if (children && typeof children === 'object')
+              Object.values(children).forEach(ch => ch && typeof ch === 'object' && walk(ch, depth + 1));
+          } catch (_) {}
+        };
+        walk(vueApp._instance?.subTree);
+        return emitted;
+      } catch (e) {
+        console.log('[PG] replayLearnedVueEmit failed:', e);
+        return false;
+      }
+    }
+
+    // ── Replay learned WebSocket message ──────────────────────────────────────
+    function replayLearnedWsMessage(learnedMsg) {
+      try {
+        const sockets = (win.__pg_wsSockets || []).filter(ws => ws.readyState === 1 /* OPEN */);
+        if (!sockets.length) {
+          console.log('[PG] replayLearnedWsMessage: no open WebSocket');
+          return false;
+        }
+        const msg = JSON.stringify({
+          command: 'message',
+          identifier: learnedMsg.identifier,
+          data: JSON.stringify(learnedMsg.data),
+        });
+        sockets[0].send(msg);
+        logEv('ORGANIZE', 'replay.ws-message', { action: learnedMsg.data?.action });
+        return true;
+      } catch (e) {
+        console.log('[PG] replayLearnedWsMessage failed:', e);
+        return false;
+      }
+    }
+
+    // ── Click learned DOM selector ─────────────────────────────────────────────
+    function clickLearnedDomSelector(selector) {
+      try {
+        const btn = document.querySelector(selector);
+        if (!btn || btn.closest('#pg-panel')) return false;
+        btn.click();
+        logEv('ORGANIZE', 'replay.dom-click', { selector });
+        return true;
+      } catch (e) {
+        console.log('[PG] clickLearnedDomSelector failed:', e);
+        return false;
+      }
     }
 
     // ── Strategy 1: CardContextMenu component ─────────────────────────────────
@@ -511,7 +630,10 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         const sockets = (win.__pg_wsSockets || []).filter(ws => ws.readyState === 1 /* OPEN */);
         if (!sockets.length) return false;
         const channelId = win.__pg_wsChannelId;
-        if (!channelId) return false;
+        if (!channelId) {
+          console.log('[PG] emitOrganizeViaWS: no channel ID captured yet — interact with the game first');
+          return false;
+        }
         // ActionCable message format
         const msg = JSON.stringify({
           command: 'message',
@@ -519,7 +641,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
           data: JSON.stringify({ action: 'organize_battlefield' }),
         });
         sockets[0].send(msg);
-        logEv('ORGANIZE', 'ws-emit.organize_battlefield', {});
+        logEv('ORGANIZE', 'ws-emit.organize_battlefield', { channelId });
         return true;
       } catch (e) { console.log('[PG] WS emit organize failed:', e); }
       return false;
@@ -540,9 +662,12 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
       logEv('HOOK-CAPTURE', 'started', {});
       console.log('[PG] Hook Capture started — now right-click a card and click "Auto organise battlefield"');
 
+      // Clear any previously captured data for this session
+      delete win.__pg_capturedWsMessage;
+
       const foundCalls = [];
 
-      // Wrap Vue component methods
+      // ── Strategy A: Wrap Vue component methods (broad name-based) ───────────
       const patchVue = (proxy, label) => {
         if (!proxy || typeof proxy !== 'object') return;
         const keys = [...Object.keys(proxy)];
@@ -588,13 +713,114 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         }
       } catch (e) { console.log('[PG] Hook Capture Vue patch error:', e); }
 
-      // Wrap Phaser scene methods
+      // ── Strategy B: Intercept Vue $emit globally ─────────────────────────────
+      // Patch the Vue app-level emit so any component emit is recorded,
+      // regardless of minified method names.
+      try {
+        const vueApp = win.__pg_vueApp;
+        if (vueApp?._instance) {
+          const patchEmit = (instance, label) => {
+            if (!instance || instance.__pg_emitPatched) return;
+            instance.__pg_emitPatched = true;
+            const origEmit = instance.emit;
+            if (typeof origEmit !== 'function') return;
+            instance.emit = function (event, ...args) {
+              if (/organiz|arrange|battlefield|board/i.test(event)) {
+                const entry = { label: `vue-emit.${label}.${event}`, args: safeSerialize(args), isEmit: true, event };
+                foundCalls.push(entry);
+                logEv('HOOK-CAPTURE-EMIT', entry.label, { args: entry.args });
+                console.log(`[PG] Hook captured emit: ${event}`, args);
+              }
+              return origEmit.call(this, event, ...args);
+            };
+            hookCapturePatches.push({ obj: instance, key: 'emit', orig: origEmit });
+          };
+
+          // Walk and patch emit on every component instance
+          const walkAndPatchEmit = (vnode, depth = 0) => {
+            if (!vnode || depth > 12) return;
+            try {
+              const c = vnode.component;
+              if (c) {
+                const name = c.type?.name || c.type?.__name || `comp_${depth}`;
+                patchEmit(c, name);
+                if (c.subTree) walkAndPatchEmit(c.subTree, depth + 1);
+              }
+              const children = vnode.children;
+              if (Array.isArray(children)) children.forEach(ch => walkAndPatchEmit(ch, depth + 1));
+              else if (children && typeof children === 'object')
+                Object.values(children).forEach(ch => ch && typeof ch === 'object' && walkAndPatchEmit(ch, depth + 1));
+            } catch (_) {}
+          };
+          walkAndPatchEmit(vueApp._instance?.subTree);
+        }
+      } catch (e) { console.log('[PG] Hook Capture Vue emit patch error:', e); }
+
+      // ── Strategy C: Intercept ALL Vue $emit calls via prototype ──────────────
+      // In Vue 3, component.emit is set per-instance. Patch the internal
+      // emit function used by the Vue runtime (accessed through the app context).
+      try {
+        const vueApp = win.__pg_vueApp;
+        if (vueApp?._context) {
+          const ctx = vueApp._context;
+          // The app's provide object may expose global-level emitters
+          // Also try patching the app-level emit if present
+          if (typeof ctx.emit === 'function' && !ctx.__pg_emitPatched) {
+            ctx.__pg_emitPatched = true;
+            const origCtxEmit = ctx.emit;
+            ctx.emit = function (event, ...args) {
+              if (/organiz|arrange|battlefield|board/i.test(String(event))) {
+                foundCalls.push({ label: `vue-ctx-emit.${event}`, args: safeSerialize(args), isEmit: true, event });
+                logEv('HOOK-CAPTURE-CTX-EMIT', event, { args: safeSerialize(args) });
+              }
+              return origCtxEmit.call(this, event, ...args);
+            };
+            hookCapturePatches.push({ obj: ctx, key: 'emit', orig: origCtxEmit });
+          }
+        }
+      } catch (e) { console.log('[PG] Hook Capture Vue context emit patch error:', e); }
+
+      // ── Strategy D: DOM click capture ────────────────────────────────────────
+      // Listen for any click on an element containing "organise" or "organize" text.
+      // This catches the actual button click and records a reliable DOM selector.
+      const domClickCapture = (e) => {
+        const el = e.target;
+        const text = (el.textContent || '').trim().toLowerCase();
+        const parentText = (el.closest('button')?.textContent || '').trim().toLowerCase();
+        if (/organis|organiz/.test(text) || /organis|organiz/.test(parentText)) {
+          const btn = el.closest('button') || el;
+          const sel = selectorFor(btn);
+          foundCalls.push({ label: `dom-click.${sel}`, args: [], isDomClick: true, selector: sel });
+          logEv('HOOK-CAPTURE-DOM', 'organize button clicked', { selector: sel, text: parentText || text });
+          console.log('[PG] Hook captured DOM click on organize button:', sel);
+          // Also try to record the outerHTML for debugging
+          win.__pg_capturedOrgBtnHtml = btn.outerHTML?.slice(0, 300);
+        }
+      };
+      document.addEventListener('click', domClickCapture, true);
+      hookCapturePatches.push({ obj: document, key: '__pg_domClickCapture', orig: null, cleanup: () => document.removeEventListener('click', domClickCapture, true) });
+
+      // ── Strategy E: Intercept dispatchEvent for custom game events ───────────
+      const origDispatch = win.EventTarget.prototype.dispatchEvent;
+      const captureDispatch = function (event) {
+        if (/organiz|arrange|action/i.test(event.type)) {
+          foundCalls.push({ label: `dispatch.${event.type}`, args: [event.detail] });
+          logEv('HOOK-CAPTURE-DISPATCH', event.type, { detail: event.detail });
+        }
+        return origDispatch.call(this, event);
+      };
+      win.EventTarget.prototype.dispatchEvent = captureDispatch;
+      hookCapturePatches.push({
+        obj: win.EventTarget.prototype, key: 'dispatchEvent',
+        orig: origDispatch,
+      });
+
+      // ── Strategy F: Wrap Phaser scene methods ────────────────────────────────
       try {
         const game = win.__pg_phaserGame;
         if (game?.scene?.scenes) {
           for (const scene of game.scene.scenes) {
             const name = scene.sys?.settings?.key || 'scene';
-            // Walk prototype chain
             let proto = scene;
             while (proto && proto !== Object.prototype) {
               for (const k of Object.getOwnPropertyNames(proto)) {
@@ -618,25 +844,11 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         }
       } catch (e) { console.log('[PG] Hook Capture Phaser patch error:', e); }
 
-      // Set up a timeout — after 30s, stop and report
+      // ── Timeout — after 30s, stop and report ─────────────────────────────────
       const timeout = setTimeout(() => {
         stopHookCapture();
         onResult(foundCalls);
       }, 30000);
-
-      // Also watch dispatchEvent for game-specific events
-      const origDispatch = win.EventTarget.prototype.dispatchEvent;
-      const captureDispatch = function (event) {
-        if (!/organiz|arrange|action/i.test(event.type)) return origDispatch.call(this, event);
-        foundCalls.push({ label: `dispatch.${event.type}`, args: [event.detail] });
-        logEv('HOOK-CAPTURE-DISPATCH', event.type, { detail: event.detail });
-        return origDispatch.call(this, event);
-      };
-      win.EventTarget.prototype.dispatchEvent = captureDispatch;
-      hookCapturePatches.push({
-        obj: win.EventTarget.prototype, key: 'dispatchEvent',
-        orig: origDispatch,
-      });
 
       // Expose a manual stop function
       win.__pg_stopCapture = () => {
@@ -650,13 +862,70 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
       if (!hookCaptureActive) return;
       hookCaptureActive = false;
       // Restore all patched methods
-      for (const { obj, key, orig } of hookCapturePatches) {
-        try { obj[key] = orig; } catch (_) {}
+      for (const patch of hookCapturePatches) {
+        try {
+          if (typeof patch.cleanup === 'function') {
+            patch.cleanup();
+          } else if (patch.orig !== null) {
+            patch.obj[patch.key] = patch.orig;
+          }
+        } catch (_) {}
       }
       hookCapturePatches = [];
       delete win.__pg_stopCapture;
       logEv('HOOK-CAPTURE', 'stopped', {});
       console.log('[PG] Hook Capture stopped');
+    }
+
+    // ── Persist all captured call types from hook capture results ─────────────
+    function saveLearnedCalls(calls) {
+      // 1. WebSocket message (highest priority — most reliable replay)
+      const wsCall = calls.find(c => c.isWsMessage);
+      if (wsCall?.wsMessage) {
+        CFG.learnedWsMessage = wsCall.wsMessage;
+        console.log('[PG] Learned WS message:', wsCall.wsMessage);
+      }
+
+      // 2. Vue emit event
+      const emitCall = calls.find(c => c.isEmit);
+      if (emitCall) {
+        CFG.learnedVueEmit = {
+          event: emitCall.event,
+          args: emitCall.args || [],
+          componentName: emitCall.label.split('.')[1] || null,
+        };
+        console.log('[PG] Learned Vue emit:', CFG.learnedVueEmit);
+      }
+
+      // 3. DOM click selector
+      const domCall = calls.find(c => c.isDomClick);
+      if (domCall?.selector) {
+        CFG.learnedDomSelector = domCall.selector;
+        console.log('[PG] Learned DOM selector:', domCall.selector);
+      }
+
+      // 4. Vue method / Phaser call (existing learnedOrganizeCall)
+      const methodCall = calls.find(c => !c.isWsMessage && !c.isEmit && !c.isDomClick && /organiz|arrange/i.test(c.label))
+                      || calls.find(c => !c.isWsMessage && !c.isEmit && !c.isDomClick);
+      if (methodCall) {
+        CFG.learnedOrganizeCall = {
+          type: methodCall.label.startsWith('vue.') ? 'vue-method' :
+                methodCall.label.startsWith('phaser.') ? 'direct-fn' : 'vue-method',
+          path: methodCall.label.replace(/^(vue\.\w+\.|phaser\.\w+\.)/, ''),
+          fullLabel: methodCall.label,
+          args: methodCall.args || [],
+        };
+        console.log('[PG] Learned method call:', CFG.learnedOrganizeCall);
+      }
+
+      saveConfig();
+      const typesLearned = [
+        wsCall ? 'WS-message' : null,
+        emitCall ? 'Vue-emit' : null,
+        domCall ? 'DOM-click' : null,
+        methodCall ? 'method-call' : null,
+      ].filter(Boolean);
+      logEv('HOOK-CAPTURE-RESULT', `saved: ${typesLearned.join(', ') || 'none'}`, { count: calls.length });
     }
 
     function safeSerialize(args) {
@@ -825,7 +1094,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
 
       const bundle = {
         meta: {
-          version: '4.0.0',
+          version: '4.1.0',
           timestamp: new Date().toISOString(),
           url: location.href,
           userAgent: navigator.userAgent,
@@ -1035,12 +1304,24 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         id: 'hook-capture',
         title: '2. Hook Capture — learn the organize action',
         desc: 'Click Start, then right-click any card and click "Auto organise battlefield". The script will intercept the call and learn how to replay it automatically.',
-        done: () => !!CFG.learnedOrganizeCall,
-        result: () => CFG.learnedOrganizeCall ? JSON.stringify(CFG.learnedOrganizeCall).slice(0, 120) : null,
+        done: () => !!(CFG.learnedOrganizeCall || CFG.learnedVueEmit || CFG.learnedWsMessage || CFG.learnedDomSelector),
+        result: () => {
+          const parts = [];
+          if (CFG.learnedWsMessage)    parts.push(`WS:${CFG.learnedWsMessage.data?.action || 'msg'}`);
+          if (CFG.learnedVueEmit)      parts.push(`emit:${CFG.learnedVueEmit.event}`);
+          if (CFG.learnedDomSelector)  parts.push(`DOM:${CFG.learnedDomSelector}`);
+          if (CFG.learnedOrganizeCall) parts.push(`method:${CFG.learnedOrganizeCall.path}`);
+          return parts.length ? parts.join(' | ') : null;
+        },
         run(setStatus) {
           setStatus('Capturing... right-click a card and click "Auto organise battlefield". (30s timeout, or click Stop in console: __pg_stopCapture())');
           rerenderWizard();
           startHookCapture((calls) => {
+            // Also absorb any WS message captured during this session
+            if (win.__pg_capturedWsMessage) {
+              calls.push({ label: 'ws-send.organize_battlefield', args: [], isWsMessage: true, wsMessage: win.__pg_capturedWsMessage });
+              delete win.__pg_capturedWsMessage;
+            }
             if (calls.length === 0) {
               setStatus('No calls captured — make sure to click the organize button while capturing');
               setTimeout(() => { setStatus(null); rerenderWizard(); }, 6000);
@@ -1048,29 +1329,14 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
             }
             logEv('HOOK-CAPTURE-RESULT', `${calls.length} calls recorded`, calls);
             console.log('[PG] Hook Capture results:', calls);
-            // Auto-save the most likely organize call
-            const organizeCall = calls.find(c => /organiz|arrange/i.test(c.label)) || calls[calls.length - 1];
-            if (organizeCall) {
-              // Map to a learnedOrganizeCall structure
-              const learned = {
-                type: organizeCall.label.startsWith('vue.') ? 'vue-method' :
-                      organizeCall.label.startsWith('phaser.') ? 'direct-fn' : 'vue-method',
-                path: organizeCall.label.replace(/^(vue\.\w+\.|phaser\.\w+\.)/, ''),
-                fullLabel: organizeCall.label,
-                args: organizeCall.args || [],
-              };
-              CFG.learnedOrganizeCall = learned;
-              saveConfig();
-              setStatus(`Learned: ${organizeCall.label} — testing now...`);
-              setTimeout(() => {
-                const ok = organizeBoard();
-                setStatus(ok ? '✅ Organize works!' : '⚠️ Learned but replay failed — check console');
-                setTimeout(() => { setStatus(null); rerenderWizard(); }, 5000);
-              }, 500);
-            } else {
-              setStatus('Captured calls but none looked like organize — check event log');
+            saveLearnedCalls(calls);
+            const label = calls[0]?.label || 'unknown';
+            setStatus(`Learned ${calls.length} call(s): ${label} — testing now...`);
+            setTimeout(() => {
+              const ok = organizeBoard();
+              setStatus(ok ? '✅ Organize works!' : '⚠️ Learned but replay failed — check console');
               setTimeout(() => { setStatus(null); rerenderWizard(); }, 5000);
-            }
+            }, 500);
           });
         },
       },
@@ -1204,8 +1470,28 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
           </label>
         </div>
         <div class="pg-row">
-          <span class="pg-label">Delay (ms)</span>
-          <input class="pg-input" id="pg-delay-input" value="${CFG.organizeDelay}" style="width:60px;flex:none">
+          <span class="pg-label">Method call</span>
+          <span class="pg-val ${CFG.learnedOrganizeCall ? '' : 'empty'}" style="font-size:9px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+            ${CFG.learnedOrganizeCall ? esc(JSON.stringify(CFG.learnedOrganizeCall).slice(0, 100)) : '(none)'}
+          </span>
+        </div>
+        <div class="pg-row">
+          <span class="pg-label">Vue emit</span>
+          <span class="pg-val ${CFG.learnedVueEmit ? '' : 'empty'}" style="font-size:9px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+            ${CFG.learnedVueEmit ? esc(JSON.stringify(CFG.learnedVueEmit).slice(0, 100)) : '(none)'}
+          </span>
+        </div>
+        <div class="pg-row">
+          <span class="pg-label">WS message</span>
+          <span class="pg-val ${CFG.learnedWsMessage ? '' : 'empty'}" style="font-size:9px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+            ${CFG.learnedWsMessage ? esc(JSON.stringify(CFG.learnedWsMessage).slice(0, 100)) : '(none)'}
+          </span>
+        </div>
+        <div class="pg-row">
+          <span class="pg-label">DOM selector</span>
+          <span class="pg-val ${CFG.learnedDomSelector ? '' : 'empty'}" style="font-size:9px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+            ${CFG.learnedDomSelector ? esc(CFG.learnedDomSelector) : '(none — run Hook Capture)'}
+          </span>
         </div>
         <div class="pg-row" style="margin-top:4px">
           <span class="pg-label">Learned call</span>
@@ -1541,26 +1827,20 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         startHookCapture((calls) => {
           statusEl.style.display = 'none';
           panelEl.querySelector('#pg-hook-capture-btn').disabled = false;
+          // Also absorb any WS message captured during this session
+          if (win.__pg_capturedWsMessage) {
+            calls.push({ label: 'ws-send.organize_battlefield', args: [], isWsMessage: true, wsMessage: win.__pg_capturedWsMessage });
+            delete win.__pg_capturedWsMessage;
+          }
           if (calls.length === 0) {
             logEv('HOOK-CAPTURE-RESULT', 'no calls captured', {});
             return;
           }
           logEv('HOOK-CAPTURE-RESULT', `${calls.length} calls captured`, calls);
           console.log('[PG] Hook Capture results:', calls);
-          // Find most likely organize call and save it
-          const organizeCall = calls.find(c => /organiz|arrange/i.test(c.label)) || calls[calls.length - 1];
-          if (organizeCall) {
-            const learned = {
-              type: organizeCall.label.startsWith('phaser.') ? 'direct-fn' : 'vue-method',
-              path: organizeCall.label.replace(/^(vue\.\w+\.|phaser\.\w+\.)/, ''),
-              fullLabel: organizeCall.label,
-              args: organizeCall.args || [],
-            };
-            CFG.learnedOrganizeCall = learned;
-            saveConfig();
-            rerenderWizard();
-            refreshConfigPanel();
-          }
+          saveLearnedCalls(calls);
+          rerenderWizard();
+          refreshConfigPanel();
         });
       };
 
@@ -1592,7 +1872,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
       refreshLogPanel();
       refreshConfigPanel();
 
-      console.log('[PG] Explorer panel opened');
+      console.log('[PG] Explorer panel opened v4.1.0');
     }
 
     function closePanel() {
