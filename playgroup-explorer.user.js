@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playgroup.gg Auto-Organizer
 // @namespace    https://playgroup.gg/
-// @version      4.1.0
+// @version      4.2.0
 // @description  Auto-organizes your board on pass turn. Press F2 to open the explorer panel.
 // @author       You
 // @match        https://playgroup.gg/*
@@ -122,7 +122,12 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
           const url = String(args[0]?.url || args[0] || '');
           const method = String(args[1]?.method || 'GET');
           const body = args[1]?.body;
-          logEv('FETCH', `${method} ${url}`, { body: body ? String(body).slice(0, 200) : null });
+          const bodyStr = body ? String(body).slice(0, 400) : null;
+          logEv('FETCH', `${method} ${url}`, { body: bodyStr });
+          // Capture organize fetch calls during hook capture
+          if (hookCaptureActive && bodyStr && /organiz|arrange/i.test(bodyStr)) {
+            win.__pg_capturedFetchCall = { url, method, body: bodyStr };
+          }
           return origFetch(...args);
         };
         win.fetch[patchedSymbol] = true;
@@ -147,6 +152,31 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
       // ── Intercept WebSocket ───────────────────────────────────────────────
       if (!win.WebSocket[patchedSymbol]) {
         const OrigWS = win.WebSocket;
+
+        // Patch prototype.send FIRST so it covers all instances — including any
+        // already-created sockets and ActionCable's internally-held reference.
+        if (!OrigWS.prototype.send[patchedSymbol]) {
+          const origProtoSend = OrigWS.prototype.send;
+          OrigWS.prototype.send = function (data) {
+            try {
+              const parsed = JSON.parse(data);
+              const inner = parsed?.data ? JSON.parse(parsed.data) : null;
+              const action = inner?.action;
+              if (action) {
+                logEv('WS-SEND', action, { identifier: parsed.identifier, data: inner });
+                // Capture channel ID from any outbound message
+                if (parsed.identifier) win.__pg_wsChannelId = parsed.identifier;
+                // Record organize message if hook capture is running
+                if (hookCaptureActive && /organiz|arrange/i.test(action)) {
+                  win.__pg_capturedWsMessage = { identifier: parsed.identifier, data: inner };
+                }
+              }
+            } catch (_) {}
+            return origProtoSend.call(this, data);
+          };
+          OrigWS.prototype.send[patchedSymbol] = true;
+        }
+
         function PatchedWS(url, protocols) {
           const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
           logEv('WS-OPEN', url, {});
@@ -188,25 +218,6 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
             }
           });
           ws.addEventListener('close', () => logEv('WS-CLOSE', url, {}));
-
-          // Intercept outbound send() so hook-capture can record organize messages
-          const origSendWs = ws.send.bind(ws);
-          ws.send = function (data) {
-            try {
-              const parsed = JSON.parse(data);
-              const inner = parsed?.data ? JSON.parse(parsed.data) : null;
-              const action = inner?.action;
-              if (action) {
-                logEv('WS-SEND', action, { identifier: parsed.identifier, data: inner });
-                // If hook capture is active, record organize messages
-                if (hookCaptureActive && /organiz|arrange/i.test(action)) {
-                  win.__pg_capturedWsMessage = { identifier: parsed.identifier, data: inner };
-                }
-              }
-            } catch (_) {}
-            return origSendWs(data);
-          };
-
           return ws;
         }
         PatchedWS.prototype = OrigWS.prototype;
@@ -664,6 +675,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
 
       // Clear any previously captured data for this session
       delete win.__pg_capturedWsMessage;
+      delete win.__pg_capturedFetchCall;
 
       const foundCalls = [];
 
@@ -780,25 +792,89 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         }
       } catch (e) { console.log('[PG] Hook Capture Vue context emit patch error:', e); }
 
-      // ── Strategy D: DOM click capture ────────────────────────────────────────
-      // Listen for any click on an element containing "organise" or "organize" text.
-      // This catches the actual button click and records a reliable DOM selector.
+      // ── Strategy D: DOM click — extract Vue onClick handler from vnode ───────
+      // When the user clicks the organize button we pull the actual handler
+      // function out of the element's Vue vnode props and store it directly.
+      // This survives minification because we never look at the function name.
       const domClickCapture = (e) => {
         const el = e.target;
         const text = (el.textContent || '').trim().toLowerCase();
         const parentText = (el.closest('button')?.textContent || '').trim().toLowerCase();
         if (/organis|organiz/.test(text) || /organis|organiz/.test(parentText)) {
           const btn = el.closest('button') || el;
-          const sel = selectorFor(btn);
-          foundCalls.push({ label: `dom-click.${sel}`, args: [], isDomClick: true, selector: sel });
-          logEv('HOOK-CAPTURE-DOM', 'organize button clicked', { selector: sel, text: parentText || text });
-          console.log('[PG] Hook captured DOM click on organize button:', sel);
-          // Also try to record the outerHTML for debugging
-          win.__pg_capturedOrgBtnHtml = btn.outerHTML?.slice(0, 300);
+
+          // Try to grab the handler from the Vue vnode of the button element
+          const vnode = btn._vei?.onClick?.value   // Vue 3 event cache
+                     || btn.__vueParentComponent?.vnode?.props?.onClick
+                     || btn._vnode?.props?.onClick;
+
+          if (typeof vnode === 'function') {
+            win.__pg_learnedFn = vnode;
+            foundCalls.push({ label: 'dom-vnode-handler', args: [], isDomClick: true, isDirectFn: true });
+            logEv('HOOK-CAPTURE-DOM', 'extracted vnode onClick handler', {});
+            console.log('[PG] Hook captured vnode onClick handler directly');
+          } else {
+            // Fallback: walk the button's Vue parent component for any
+            // method that was just called (we catch it via Vue emit above)
+            const comp = btn.__vueParentComponent;
+            if (comp) {
+              const proxy = comp.proxy || comp.ctx;
+              const name = comp.type?.name || comp.type?.__name || 'unknown';
+              if (proxy) patchVue(proxy, `vue.${name}`);
+              logEv('HOOK-CAPTURE-DOM', `found parent component: ${name}`, { keys: Object.keys(proxy || {}).slice(0, 20) });
+            }
+            // Also store the selector as last-resort fallback
+            const sel = selectorFor(btn);
+            foundCalls.push({ label: `dom-click.${sel}`, args: [], isDomClick: true, selector: sel });
+            logEv('HOOK-CAPTURE-DOM', 'organize button clicked (no vnode handler)', { selector: sel });
+            console.log('[PG] Hook captured DOM click (no vnode fn), selector:', sel);
+          }
         }
       };
       document.addEventListener('click', domClickCapture, true);
       hookCapturePatches.push({ obj: document, key: '__pg_domClickCapture', orig: null, cleanup: () => document.removeEventListener('click', domClickCapture, true) });
+
+      // ── Strategy G: MutationObserver — patch CardContextMenu when it mounts ─
+      // The context menu component doesn't exist until a card is right-clicked,
+      // so we watch for it appearing and immediately patch all its methods.
+      const menuObserver = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          for (const node of m.addedNodes) {
+            if (!(node instanceof Element)) continue;
+            const menuEl = node.classList?.contains('card-context-menu') ? node
+                         : node.querySelector?.('.card-context-menu');
+            if (!menuEl) continue;
+            // Walk every button in the menu
+            menuEl.querySelectorAll('button').forEach(btn => {
+              const comp = btn.__vueParentComponent
+                        || btn.closest('[data-v]')?.__vueParentComponent;
+              if (!comp) return;
+              const proxy = comp.proxy || comp.ctx;
+              const name = comp.type?.name || comp.type?.__name || 'CtxMenu';
+              if (proxy) {
+                patchVue(proxy, `vue.${name}`);
+                // Also patch emit on this freshly mounted component
+                if (comp.emit && !comp.__pg_emitPatched) {
+                  comp.__pg_emitPatched = true;
+                  const origEmit = comp.emit;
+                  comp.emit = function (event, ...args) {
+                    if (/organis|organiz|arrange|battlefield|board/i.test(String(event))) {
+                      foundCalls.push({ label: `vue-emit.${name}.${event}`, args: safeSerialize(args), isEmit: true, event });
+                      logEv('HOOK-CAPTURE-EMIT', `${name}.${event}`, { args: safeSerialize(args) });
+                      console.log(`[PG] Hook captured menu emit: ${event}`, args);
+                    }
+                    return origEmit.call(this, event, ...args);
+                  };
+                  hookCapturePatches.push({ obj: comp, key: 'emit', orig: origEmit });
+                }
+                logEv('HOOK-CAPTURE-MENU', `patched ${name}`, { keys: Object.keys(proxy).slice(0, 20) });
+              }
+            });
+          }
+        }
+      });
+      menuObserver.observe(document.body, { childList: true, subtree: true });
+      hookCapturePatches.push({ obj: null, key: null, orig: null, cleanup: () => menuObserver.disconnect() });
 
       // ── Strategy E: Intercept dispatchEvent for custom game events ───────────
       const origDispatch = win.EventTarget.prototype.dispatchEvent;
@@ -897,33 +973,44 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         console.log('[PG] Learned Vue emit:', CFG.learnedVueEmit);
       }
 
-      // 3. DOM click selector
-      const domCall = calls.find(c => c.isDomClick);
+      // 3. Direct vnode handler (most reliable Vue path — survives minification)
+      const directFnCall = calls.find(c => c.isDomClick && c.isDirectFn);
+      if (directFnCall) {
+        // win.__pg_learnedFn already set in domClickCapture
+        CFG.learnedOrganizeCall = { type: 'direct-fn', path: '', fullLabel: 'dom-vnode-handler', args: [] };
+        console.log('[PG] Learned direct vnode fn');
+      }
+
+      // 4. Vue method / Phaser call (existing learnedOrganizeCall, if no direct-fn)
+      if (!directFnCall) {
+        const methodCall = calls.find(c => !c.isWsMessage && !c.isEmit && !c.isDomClick && /organiz|arrange/i.test(c.label))
+                        || calls.find(c => !c.isWsMessage && !c.isEmit && !c.isDomClick);
+        if (methodCall) {
+          CFG.learnedOrganizeCall = {
+            type: methodCall.label.startsWith('vue.') ? 'vue-method' :
+                  methodCall.label.startsWith('phaser.') ? 'direct-fn' : 'vue-method',
+            path: methodCall.label.replace(/^(vue\.\w+\.|phaser\.\w+\.)/, ''),
+            fullLabel: methodCall.label,
+            args: methodCall.args || [],
+          };
+          console.log('[PG] Learned method call:', CFG.learnedOrganizeCall);
+        }
+      }
+
+      // 5. DOM selector (last-resort fallback for clickOrganizeButton)
+      const domCall = calls.find(c => c.isDomClick && !c.isDirectFn && c.selector);
       if (domCall?.selector) {
         CFG.learnedDomSelector = domCall.selector;
         console.log('[PG] Learned DOM selector:', domCall.selector);
-      }
-
-      // 4. Vue method / Phaser call (existing learnedOrganizeCall)
-      const methodCall = calls.find(c => !c.isWsMessage && !c.isEmit && !c.isDomClick && /organiz|arrange/i.test(c.label))
-                      || calls.find(c => !c.isWsMessage && !c.isEmit && !c.isDomClick);
-      if (methodCall) {
-        CFG.learnedOrganizeCall = {
-          type: methodCall.label.startsWith('vue.') ? 'vue-method' :
-                methodCall.label.startsWith('phaser.') ? 'direct-fn' : 'vue-method',
-          path: methodCall.label.replace(/^(vue\.\w+\.|phaser\.\w+\.)/, ''),
-          fullLabel: methodCall.label,
-          args: methodCall.args || [],
-        };
-        console.log('[PG] Learned method call:', CFG.learnedOrganizeCall);
       }
 
       saveConfig();
       const typesLearned = [
         wsCall ? 'WS-message' : null,
         emitCall ? 'Vue-emit' : null,
-        domCall ? 'DOM-click' : null,
-        methodCall ? 'method-call' : null,
+        directFnCall ? 'direct-fn' : null,
+        !directFnCall && CFG.learnedOrganizeCall ? 'method-call' : null,
+        domCall ? 'DOM-selector' : null,
       ].filter(Boolean);
       logEv('HOOK-CAPTURE-RESULT', `saved: ${typesLearned.join(', ') || 'none'}`, { count: calls.length });
     }
@@ -1094,7 +1181,7 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
 
       const bundle = {
         meta: {
-          version: '4.1.0',
+          version: '4.2.0',
           timestamp: new Date().toISOString(),
           url: location.href,
           userAgent: navigator.userAgent,
@@ -1317,10 +1404,14 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
           setStatus('Capturing... right-click a card and click "Auto organise battlefield". (30s timeout, or click Stop in console: __pg_stopCapture())');
           rerenderWizard();
           startHookCapture((calls) => {
-            // Also absorb any WS message captured during this session
+            // Absorb any out-of-band captures from WS/fetch intercepts
             if (win.__pg_capturedWsMessage) {
               calls.push({ label: 'ws-send.organize_battlefield', args: [], isWsMessage: true, wsMessage: win.__pg_capturedWsMessage });
               delete win.__pg_capturedWsMessage;
+            }
+            if (win.__pg_capturedFetchCall) {
+              calls.push({ label: 'fetch.organize', args: [], isFetch: true, fetchCall: win.__pg_capturedFetchCall });
+              delete win.__pg_capturedFetchCall;
             }
             if (calls.length === 0) {
               setStatus('No calls captured — make sure to click the organize button while capturing');
@@ -1827,10 +1918,14 @@ console.log('[PG] Playgroup.gg Auto-Organizer v4.0 loading... URL:', location.hr
         startHookCapture((calls) => {
           statusEl.style.display = 'none';
           panelEl.querySelector('#pg-hook-capture-btn').disabled = false;
-          // Also absorb any WS message captured during this session
+          // Absorb any out-of-band captures from WS/fetch intercepts
           if (win.__pg_capturedWsMessage) {
             calls.push({ label: 'ws-send.organize_battlefield', args: [], isWsMessage: true, wsMessage: win.__pg_capturedWsMessage });
             delete win.__pg_capturedWsMessage;
+          }
+          if (win.__pg_capturedFetchCall) {
+            calls.push({ label: 'fetch.organize', args: [], isFetch: true, fetchCall: win.__pg_capturedFetchCall });
+            delete win.__pg_capturedFetchCall;
           }
           if (calls.length === 0) {
             logEv('HOOK-CAPTURE-RESULT', 'no calls captured', {});
